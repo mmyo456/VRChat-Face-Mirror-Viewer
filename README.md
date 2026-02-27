@@ -38,3 +38,8 @@
 ---
 
 > 截屏保存目录在exe的根目录
+
+# 鸣谢
+
+- [KlakSpout](https://github.com/keijiro/KlakSpout) - 提供的代码参考
+- [spout-ndi-viewer](https://github.com/sugi-cho/spout-ndi-viewer) - 提供的代码参考
