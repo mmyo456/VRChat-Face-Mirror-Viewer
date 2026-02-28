@@ -38,10 +38,11 @@
 
 ---
 
-# 说明
+# 其他说明
 
-> 截屏保存目录在exe文件的根目录。
-> 也可以读其他spout流，比如VRChat直播相机。
+- 截屏保存目录在exe文件的根目录。
+- 也可以读其他spout流，比如VRChat直播相机。
+- 使用Unity6，DX12,可能不兼容不支持DX12的设备。
 
 ---
 
@@ -50,3 +51,4 @@
 - [KlakSpout](https://github.com/keijiro/KlakSpout) - 提供的代码参考
 
 - [spout-ndi-viewer](https://github.com/sugi-cho/spout-ndi-viewer) - 提供的代码参考
+
