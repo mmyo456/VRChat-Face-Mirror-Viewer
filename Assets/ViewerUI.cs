@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using UnityEngine;
@@ -10,7 +11,21 @@ public class ViewerUI : MonoBehaviour
 {
     private bool initialized;
     private VisualElement boundRoot;
+    private Texture2D customBackgroundTexture;
     private readonly CompositeDisposable runtimeSubscriptions = new CompositeDisposable();
+    private const string SettingsFileName = "viewer-settings.json";
+
+    [Serializable]
+    private class ViewerSettings
+    {
+        public string spoutSourceName = string.Empty;
+        public string backgroundMode = "默认";
+        public string backgroundPath = string.Empty;
+        public bool scaleToScreen = true;
+        public bool mirror;
+        public bool fullScreen;
+        public bool topMost;
+    }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
     private const uint MonitorDefaultToNearest = 2;
@@ -45,7 +60,55 @@ public class ViewerUI : MonoBehaviour
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetMonitorInfo(System.IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("comdlg32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetOpenFileName([In, Out] OpenFileName ofn);
+
+    private const int OfnExplorer = 0x00080000;
+    private const int OfnPathMustExist = 0x00000800;
+    private const int OfnFileMustExist = 0x00001000;
+    private const int OfnHideReadOnly = 0x00000004;
+    private const int OfnNoChangeDir = 0x00000008;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private sealed class OpenFileName
+    {
+        public int structSize = Marshal.SizeOf(typeof(OpenFileName));
+        public IntPtr dlgOwner = IntPtr.Zero;
+        public IntPtr instance = IntPtr.Zero;
+        public string filter = null;
+        public string customFilter = null;
+        public int maxCustFilter = 0;
+        public int filterIndex = 1;
+        public string file = new string('\0', 1024);
+        public int maxFile = 1024;
+        public string fileTitle = new string('\0', 256);
+        public int maxFileTitle = 256;
+        public string initialDir = null;
+        public string title = null;
+        public int flags = 0;
+        public short fileOffset = 0;
+        public short fileExtension = 0;
+        public string defExt = null;
+        public IntPtr custData = IntPtr.Zero;
+        public IntPtr hook = IntPtr.Zero;
+        public string templateName = null;
+        public IntPtr reservedPtr = IntPtr.Zero;
+        public int reservedInt = 0;
+        public int flagsEx = 0;
+    }
 #endif
+
+    private void OnDestroy()
+    {
+        runtimeSubscriptions.Dispose();
+        if (customBackgroundTexture != null)
+        {
+            Destroy(customBackgroundTexture);
+            customBackgroundTexture = null;
+        }
+    }
 
     private void OnEnable()
     {
@@ -75,38 +138,97 @@ public class ViewerUI : MonoBehaviour
 
         runtimeSubscriptions.Clear();
         boundRoot = root;
+
         var bg = root.Q("BG");
         var scaled = root.Q("Scaled");
         var unscaled = root.Q("Unscaled");
+        var unscaledContent = unscaled?.parent;
+
+        var customScaledLayer = bg?.Q<VisualElement>("CustomBgScaled");
+        if (bg != null && customScaledLayer == null)
+        {
+            customScaledLayer = new VisualElement { name = "CustomBgScaled" };
+            customScaledLayer.style.position = Position.Absolute;
+            customScaledLayer.style.left = 0f;
+            customScaledLayer.style.top = 0f;
+            customScaledLayer.style.right = 0f;
+            customScaledLayer.style.bottom = 0f;
+            customScaledLayer.style.display = DisplayStyle.None;
+            customScaledLayer.style.backgroundColor = Color.clear;
+            customScaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+            customScaledLayer.pickingMode = PickingMode.Ignore;
+            bg.Insert(0, customScaledLayer);
+        }
+
+        var customUnscaledLayer = unscaledContent?.Q<VisualElement>("CustomBgUnscaled");
+        if (unscaledContent != null && customUnscaledLayer == null)
+        {
+            customUnscaledLayer = new VisualElement { name = "CustomBgUnscaled" };
+            customUnscaledLayer.style.position = Position.Absolute;
+            customUnscaledLayer.style.left = 0f;
+            customUnscaledLayer.style.top = 0f;
+            customUnscaledLayer.style.display = DisplayStyle.None;
+            customUnscaledLayer.style.backgroundColor = Color.clear;
+            customUnscaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+            customUnscaledLayer.pickingMode = PickingMode.Ignore;
+            unscaledContent.Insert(0, customUnscaledLayer);
+        }
         var controlPanel = root.Q<VisualElement>("ControlPanel");
         var spoutDropdown = root.Q<DropdownField>("SpoutNames");
+        var backgroundModeDropdown = root.Q<DropdownField>("BgMode");
+        var backgroundPathField = root.Q<TextField>("BgPath");
         var scrollView = root.Q<ScrollView>("UnscaledScroll");
         var topMost = root.Q<Toggle>("TopMost");
         var scaleToggle = root.Q<Toggle>("TexScale");
         var mirrorToggle = root.Q<Toggle>("Mirror");
         var fullScreenToggle = root.Q<Toggle>("FullScreen");
-        var saveButton = root.Q<Button>();
+        var saveTextureButton = root.Q<Button>("SaveTexture");
+        var saveSettingsButton = root.Q<Button>("SaveSettings");
 
         var spoutReceiver = GetComponent<SpoutReceiver>();
         if (spoutReceiver == null)
         {
             return;
         }
-        var currentTex = (RenderTexture)null;
+
+                var currentTex = (RenderTexture)null;
         var lastControlPanelActivityTime = Time.unscaledTime;
         var isSourceDropdownInteracting = false;
         var lastSourceDropdownInteractionTime = Time.unscaledTime;
+        var lastBackgroundPickerOpenTime = -10f;
         var windowedWidth = Screen.width;
         var windowedHeight = Screen.height;
         var lastScreenWidth = Screen.width;
         var lastScreenHeight = Screen.height;
+        var loadedSettings = LoadSettings();
+
+        if (scaled != null)
+        {
+            scaled.style.backgroundColor = Color.clear;
+        }
+        if (scrollView != null)
+        {
+            scrollView.style.backgroundColor = Color.clear;
+        }
 
         if (spoutDropdown != null)
         {
             spoutDropdown.style.display = DisplayStyle.Flex;
             spoutDropdown.choices = SpoutManager.GetSourceNames().ToList();
+            if (loadedSettings != null && !string.IsNullOrWhiteSpace(loadedSettings.spoutSourceName) && spoutDropdown.choices.Contains(loadedSettings.spoutSourceName))
+            {
+                spoutDropdown.SetValueWithoutNotify(loadedSettings.spoutSourceName);
+            }
+            else if (spoutDropdown.choices.Count > 0 && string.IsNullOrWhiteSpace(spoutDropdown.value))
+            {
+                spoutDropdown.SetValueWithoutNotify(spoutDropdown.choices[0]);
+            }
+            if (!string.IsNullOrWhiteSpace(spoutDropdown.value))
+            {
+                spoutReceiver.sourceName = spoutDropdown.value;
+            }
             spoutDropdown.RegisterValueChangedCallback(evt => spoutReceiver.sourceName = evt.newValue);
-            spoutDropdown.RegisterCallback<FocusInEvent>(evt =>
+            spoutDropdown.RegisterCallback<FocusInEvent>(_ =>
             {
                 isSourceDropdownInteracting = true;
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
@@ -120,15 +242,69 @@ public class ViewerUI : MonoBehaviour
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
                 MarkControlPanelActive();
             });
-            spoutDropdown.RegisterCallback<FocusOutEvent>(_ =>
-            {
-                lastSourceDropdownInteractionTime = Time.unscaledTime;
-            });
+            spoutDropdown.RegisterCallback<FocusOutEvent>(_ => lastSourceDropdownInteractionTime = Time.unscaledTime);
             spoutDropdown.RegisterValueChangedCallback(_ =>
             {
                 isSourceDropdownInteracting = false;
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
             });
+        }
+
+        if (backgroundModeDropdown != null)
+        {
+            backgroundModeDropdown.choices = new[] { "默认", "红色", "蓝色", "绿色", "洋红色", "灰色", "白色", "自定义" }.ToList();
+            if (!backgroundModeDropdown.choices.Contains(backgroundModeDropdown.value))
+            {
+                backgroundModeDropdown.SetValueWithoutNotify("默认");
+            }
+            if (loadedSettings != null && !string.IsNullOrWhiteSpace(loadedSettings.backgroundMode) && backgroundModeDropdown.choices.Contains(loadedSettings.backgroundMode))
+            {
+                backgroundModeDropdown.SetValueWithoutNotify(loadedSettings.backgroundMode);
+            }
+
+            backgroundModeDropdown.RegisterValueChangedCallback(_ =>
+            {
+                UpdateBackgroundControlsVisibility();
+                ApplyBackgroundFromSelection();
+                MarkControlPanelActive();
+            });
+        }
+        if (backgroundPathField != null && loadedSettings != null)
+        {
+            backgroundPathField.SetValueWithoutNotify(loadedSettings.backgroundPath ?? string.Empty);
+        }
+
+
+        backgroundPathField?.RegisterValueChangedCallback(_ =>
+        {
+            if (IsCustomBackgroundMode())
+            {
+                ApplyBackgroundFromSelection();
+            }
+            MarkControlPanelActive();
+        });
+
+        backgroundPathField?.RegisterCallback<PointerDownEvent>(evt =>
+        {
+            if (evt.button == (int)MouseButton.RightMouse)
+            {
+                return;
+            }
+
+            TryOpenBackgroundPicker();
+        }, TrickleDown.TrickleDown);
+
+                backgroundPathField?.RegisterCallback<ClickEvent>(_ =>
+        {
+            TryOpenBackgroundPicker();
+        }, TrickleDown.TrickleDown);
+
+        UpdateBackgroundControlsVisibility();
+        ApplyBackgroundFromSelection();
+
+        if (topMost != null && loadedSettings != null)
+        {
+            topMost.SetValueWithoutNotify(loadedSettings.topMost);
         }
 
         topMost?.RegisterValueChangedCallback(evt =>
@@ -139,21 +315,47 @@ public class ViewerUI : MonoBehaviour
             }
             MarkControlPanelActive();
         });
+
+        if (alwaysOnTop != null && topMost != null)
+        {
+            alwaysOnTop.AssignTopmostWindow(Application.productName, topMost.value);
+        }
+
         scaleToggle?.RegisterValueChangedCallback(evt =>
         {
             if (scrollView != null)
             {
                 scrollView.style.display = evt.newValue ? DisplayStyle.None : DisplayStyle.Flex;
             }
+            if (scaled != null)
+            {
+                scaled.style.display = evt.newValue ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+            UpdateCustomBackgroundScaleMode();
             MarkControlPanelActive();
         });
-        if (scaleToggle != null && scrollView != null)
+
+        var initialScaleToScreen = loadedSettings != null ? loadedSettings.scaleToScreen : true;
+        if (scaleToggle != null)
         {
-            scaleToggle.SetValueWithoutNotify(true);
-            scrollView.style.display = DisplayStyle.None;
+            scaleToggle.SetValueWithoutNotify(initialScaleToScreen);
         }
+        if (scrollView != null)
+        {
+            scrollView.style.display = initialScaleToScreen ? DisplayStyle.None : DisplayStyle.Flex;
+        }
+        if (scaled != null)
+        {
+            scaled.style.display = initialScaleToScreen ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+        UpdateCustomBackgroundScaleMode();
+
         if (mirrorToggle != null)
         {
+            if (loadedSettings != null)
+            {
+                mirrorToggle.SetValueWithoutNotify(loadedSettings.mirror);
+            }
             mirrorToggle.RegisterValueChangedCallback(evt =>
             {
                 SetMirror(evt.newValue);
@@ -161,25 +363,52 @@ public class ViewerUI : MonoBehaviour
             });
             SetMirror(mirrorToggle.value);
         }
+
         if (fullScreenToggle != null)
         {
-            fullScreenToggle.SetValueWithoutNotify(IsFullscreenActive());
+            var initialFullscreen = loadedSettings != null ? loadedSettings.fullScreen : IsFullscreenActive();
+            fullScreenToggle.SetValueWithoutNotify(initialFullscreen);
             fullScreenToggle.RegisterValueChangedCallback(evt =>
             {
                 SetFullScreen(evt.newValue);
                 MarkControlPanelActive();
             });
+            if (initialFullscreen != IsFullscreenActive())
+            {
+                SetFullScreen(initialFullscreen);
+            }
         }
-        if (saveButton != null)
+
+        if (saveTextureButton != null)
         {
-            saveButton.clicked += () =>
+            saveTextureButton.clicked += () =>
             {
                 SaveTexture();
                 MarkControlPanelActive();
             };
         }
+
+        if (saveSettingsButton != null)
+        {
+            saveSettingsButton.clicked += () =>
+            {
+                SaveSettings(new ViewerSettings
+                {
+                    spoutSourceName = spoutDropdown != null ? spoutDropdown.value : string.Empty,
+                    backgroundMode = backgroundModeDropdown != null ? backgroundModeDropdown.value : "默认",
+                    backgroundPath = backgroundPathField != null ? backgroundPathField.value : string.Empty,
+                    scaleToScreen = scaleToggle != null && scaleToggle.value,
+                    mirror = mirrorToggle != null && mirrorToggle.value,
+                    fullScreen = fullScreenToggle != null ? fullScreenToggle.value : IsFullscreenActive(),
+                    topMost = topMost != null && topMost.value
+                });
+                MarkControlPanelActive();
+            };
+        }
+
         controlPanel?.RegisterCallback<PointerDownEvent>(_ => MarkControlPanelActive());
-        root.RegisterCallback<GeometryChangedEvent>(_ => UpdateControlPanelLayout());
+        root.RegisterCallback<GeometryChangedEvent>(_ => { UpdateControlPanelLayout(); UpdateCustomBackgroundScaleMode(); });
+
         HideControlPanelImmediately();
         UpdateControlPanelLayout();
 
@@ -196,6 +425,7 @@ public class ViewerUI : MonoBehaviour
                     lastScreenWidth = Screen.width;
                     lastScreenHeight = Screen.height;
                     UpdateControlPanelLayout();
+                    UpdateCustomBackgroundScaleMode();
                 }
 
                 UpdateControlPanel();
@@ -203,6 +433,217 @@ public class ViewerUI : MonoBehaviour
             .AddTo(runtimeSubscriptions);
 
         initialized = true;
+
+        bool IsCustomBackgroundMode()
+        {
+            return backgroundModeDropdown != null && backgroundModeDropdown.value == "自定义";
+        }
+
+        void TryOpenBackgroundPicker()
+        {
+            if (backgroundPathField == null || !IsCustomBackgroundMode())
+            {
+                return;
+            }
+
+            if (Time.unscaledTime - lastBackgroundPickerOpenTime < 0.25f)
+            {
+                return;
+            }
+
+            lastBackgroundPickerOpenTime = Time.unscaledTime;
+            var selectedPath = OpenImageFileDialog();
+            if (!string.IsNullOrWhiteSpace(selectedPath))
+            {
+                backgroundPathField.SetValueWithoutNotify(selectedPath);
+                ApplyBackgroundFromSelection();
+            }
+
+            MarkControlPanelActive();
+        }
+
+        ScaleMode GetCustomBackgroundScaleMode()
+        {
+            return scaleToggle != null && scaleToggle.value
+                ? ScaleMode.ScaleToFit
+                : ScaleMode.ScaleAndCrop;
+        }
+
+        void UpdateCustomBackgroundScaleMode()
+        {
+            if (customBackgroundTexture == null || !IsCustomBackgroundMode())
+            {
+                if (customScaledLayer != null)
+                {
+                    customScaledLayer.style.display = DisplayStyle.None;
+                }
+                if (customUnscaledLayer != null)
+                {
+                    customUnscaledLayer.style.display = DisplayStyle.None;
+                }
+                return;
+            }
+
+            var scaleToScreen = scaleToggle != null && scaleToggle.value;
+            if (scaleToScreen)
+            {
+                if (customScaledLayer != null)
+                {
+                    customScaledLayer.style.display = DisplayStyle.Flex;
+                    customScaledLayer.style.left = 0f;
+                    customScaledLayer.style.top = 0f;
+                    customScaledLayer.style.right = 0f;
+                    customScaledLayer.style.bottom = 0f;
+                    customScaledLayer.style.width = StyleKeyword.Auto;
+                    customScaledLayer.style.height = StyleKeyword.Auto;
+                    customScaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+                }
+
+                if (customUnscaledLayer != null)
+                {
+                    customUnscaledLayer.style.display = DisplayStyle.None;
+                }
+
+                return;
+            }
+
+            if (customScaledLayer != null)
+            {
+                customScaledLayer.style.display = DisplayStyle.None;
+            }
+
+            if (customUnscaledLayer != null)
+            {
+                var targetWidth = customBackgroundTexture.width;
+                var targetHeight = customBackgroundTexture.height;
+                if (currentTex != null)
+                {
+                    targetWidth = currentTex.width;
+                    targetHeight = currentTex.height;
+                }
+
+                customUnscaledLayer.style.width = targetWidth;
+                customUnscaledLayer.style.height = targetHeight;
+                customUnscaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+                customUnscaledLayer.style.display = DisplayStyle.Flex;
+            }
+        }
+
+        void UpdateBackgroundControlsVisibility()
+        {
+            var showCustom = IsCustomBackgroundMode();
+            if (backgroundPathField != null)
+            {
+                backgroundPathField.style.display = showCustom ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+        }
+
+        void ApplyBackgroundFromSelection()
+        {
+            var mode = backgroundModeDropdown != null ? backgroundModeDropdown.value : "默认";
+            switch (mode)
+            {
+                case "红色":
+                    ApplyBackgroundColor(new Color(0.75f, 0.1f, 0.1f, 1f));
+                    break;
+                case "蓝色":
+                    ApplyBackgroundColor(new Color(0.1f, 0.25f, 0.75f, 1f));
+                    break;
+                case "绿色":
+                    ApplyBackgroundColor(new Color(0.1f, 0.6f, 0.2f, 1f));
+                    break;
+                case "洋红色":
+                    ApplyBackgroundColor(new Color(0.8f, 0.15f, 0.8f, 1f));
+                    break;
+                case "灰色":
+                    ApplyBackgroundColor(new Color(0.25f, 0.25f, 0.25f, 1f));
+                    break;
+                case "白色":
+                    ApplyBackgroundColor(Color.white);
+                    break;
+                case "自定义":
+                    ApplyCustomBackground(backgroundPathField != null ? backgroundPathField.value : string.Empty);
+                    break;
+                default:
+                    ApplyBackgroundColor(Color.black);
+                    break;
+            }
+        }
+
+        void ApplyBackgroundColor(Color color)
+        {
+            if (bg == null)
+            {
+                return;
+            }
+
+            if (customScaledLayer != null)
+            {
+                customScaledLayer.style.display = DisplayStyle.None;
+                customScaledLayer.style.backgroundImage = StyleKeyword.None;
+            }
+            if (customUnscaledLayer != null)
+            {
+                customUnscaledLayer.style.display = DisplayStyle.None;
+                customUnscaledLayer.style.backgroundImage = StyleKeyword.None;
+            }
+
+            bg.style.backgroundImage = StyleKeyword.None;
+            bg.style.backgroundColor = color;
+        }
+
+        void ApplyCustomBackground(string path)
+        {
+            if (bg == null)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            {
+                ApplyBackgroundColor(Color.black);
+                return;
+            }
+
+            try
+            {
+                var bytes = File.ReadAllBytes(path);
+                var loaded = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (!loaded.LoadImage(bytes))
+                {
+                    Destroy(loaded);
+                    ApplyBackgroundColor(Color.black);
+                    return;
+                }
+
+                if (customBackgroundTexture != null)
+                {
+                    Destroy(customBackgroundTexture);
+                }
+
+                customBackgroundTexture = loaded;
+                if (customScaledLayer != null)
+                {
+                    customScaledLayer.style.backgroundImage = Background.FromTexture2D(customBackgroundTexture);
+                }
+                if (customUnscaledLayer != null)
+                {
+                    customUnscaledLayer.style.backgroundImage = Background.FromTexture2D(customBackgroundTexture);
+                }
+                if (customScaledLayer == null && customUnscaledLayer == null)
+                {
+                    bg.style.backgroundImage = Background.FromTexture2D(customBackgroundTexture);
+                    bg.style.unityBackgroundScaleMode = GetCustomBackgroundScaleMode();
+                }
+
+                bg.style.backgroundColor = Color.black;
+                UpdateCustomBackgroundScaleMode();
+            }
+            catch
+            {
+                ApplyBackgroundColor(Color.black);
+            }
+        }
 
         void SetTexture(RenderTexture tex, string texName = "")
         {
@@ -212,11 +653,20 @@ public class ViewerUI : MonoBehaviour
                 var scaledTarget = scaled ?? bg;
                 scaledTarget.style.backgroundImage = Background.FromRenderTexture(tex);
                 scaledTarget.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
-                unscaled.style.backgroundImage = Background.FromRenderTexture(tex);
-                unscaled.style.width = tex.width;
-                unscaled.style.height = tex.height;
+                if (unscaled != null)
+                {
+                    unscaled.style.backgroundImage = Background.FromRenderTexture(tex);
+                    unscaled.style.width = tex.width;
+                    unscaled.style.height = tex.height;
+                }
+                if (customUnscaledLayer != null)
+                {
+                    customUnscaledLayer.style.width = tex.width;
+                    customUnscaledLayer.style.height = tex.height;
+                }
                 EnsureScaledViewportFill();
                 currentTex.name = texName;
+                UpdateCustomBackgroundScaleMode();
             }
         }
 
@@ -229,8 +679,15 @@ public class ViewerUI : MonoBehaviour
             {
                 unscaled.transform.scale = new Vector3(x, 1f, 1f);
             }
+            if (customScaledLayer != null)
+            {
+                customScaledLayer.transform.scale = new Vector3(x, 1f, 1f);
+            }
+            if (customUnscaledLayer != null)
+            {
+                customUnscaledLayer.transform.scale = new Vector3(x, 1f, 1f);
+            }
         }
-
         void SetFullScreen(bool isFullScreen)
         {
             var currentlyFullscreen = IsFullscreenActive();
@@ -488,9 +945,7 @@ public class ViewerUI : MonoBehaviour
             }
 
             var dropdownPopupVisible = IsAnyDropdownPopupVisible();
-            if (isSourceDropdownInteracting
-                && !dropdownPopupVisible
-                && Time.unscaledTime - lastSourceDropdownInteractionTime > 0.25f)
+            if (isSourceDropdownInteracting && !dropdownPopupVisible && Time.unscaledTime - lastSourceDropdownInteractionTime > 0.25f)
             {
                 isSourceDropdownInteracting = false;
             }
@@ -594,10 +1049,7 @@ public class ViewerUI : MonoBehaviour
 
         void CloseSourceDropdownPopupSafely()
         {
-            if (spoutDropdown != null)
-            {
-                spoutDropdown.Blur();
-            }
+            spoutDropdown?.Blur();
         }
 
         void SetControlPanelInteractive(bool isInteractive)
@@ -655,6 +1107,142 @@ public class ViewerUI : MonoBehaviour
             }
         }
     }
+
+    private string GetSettingsFilePath()
+    {
+        try
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(exePath))
+            {
+                var exeDir = Path.GetDirectoryName(exePath);
+                if (!string.IsNullOrWhiteSpace(exeDir))
+                {
+                    return Path.Combine(exeDir, SettingsFileName);
+                }
+            }
+#endif
+            var dataDir = Directory.GetParent(Application.dataPath);
+            return Path.Combine(dataDir != null ? dataDir.FullName : Application.dataPath, SettingsFileName);
+        }
+        catch
+        {
+            return Path.Combine(Application.dataPath, SettingsFileName);
+        }
+    }
+
+    private ViewerSettings LoadSettings()
+    {
+        var path = GetSettingsFilePath();
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            return JsonUtility.FromJson<ViewerSettings>(json);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to load settings: {e.Message}");
+            return null;
+        }
+    }
+
+    private void SaveSettings(ViewerSettings settings)
+    {
+        if (settings == null)
+        {
+            return;
+        }
+
+        var path = GetSettingsFilePath();
+        try
+        {
+            var json = JsonUtility.ToJson(settings, true);
+            File.WriteAllText(path, json);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to save settings: {e.Message}");
+        }
+    }
+    private string OpenImageFileDialog()
+    {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        return OpenWindowsImageFileDialog();
+#else
+        return string.Empty;
+#endif
+    }
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+    private string OpenWindowsImageFileDialog()
+    {
+        var openFileName = new OpenFileName
+        {
+            dlgOwner = GetActiveWindow(),
+            filter = "图片文件 (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.tga;*.exr;*.hdr;*.ico)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.tga;*.exr;*.hdr;*.ico\0所有文件 (*.*)\0*.*\0\0",
+            initialDir = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            title = "选择背景图片",
+            flags = OfnExplorer | OfnPathMustExist | OfnFileMustExist | OfnHideReadOnly | OfnNoChangeDir
+        };
+
+        if (openFileName.dlgOwner == IntPtr.Zero)
+        {
+            openFileName.dlgOwner = FindWindow(null, Application.productName);
+        }
+
+        if (!GetOpenFileName(openFileName))
+        {
+            return string.Empty;
+        }
+
+        var selectedPath = openFileName.file;
+        var nullIndex = selectedPath.IndexOf('\0');
+        if (nullIndex >= 0)
+        {
+            selectedPath = selectedPath.Substring(0, nullIndex);
+        }
+
+        return selectedPath;
+    }
+#endif
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
