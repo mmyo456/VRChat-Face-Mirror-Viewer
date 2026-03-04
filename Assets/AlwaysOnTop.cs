@@ -1,22 +1,26 @@
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
 
-using UnityEngine;
 using System;
 using System.Runtime.InteropServices;
+using UnityEngine;
 
-
+// Windows 窗口置顶控制脚本。
 public class AlwaysOnTop : MonoBehaviour
 {
     #region WIN32API
 
-    public static readonly System.IntPtr HWND_TOPMOST = new System.IntPtr(-1);
-    public static readonly System.IntPtr HWND_NOT_TOPMOST = new System.IntPtr(-2);
-    const System.UInt32 SWP_SHOWWINDOW = 0x0040;
+    // Win32 置顶/取消置顶标记。
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOT_TOPMOST = new IntPtr(-2);
+    private const uint SWP_SHOWWINDOW = 0x0040;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
     {
-        public int Left, Top, Right, Bottom;
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
 
         public RECT(int left, int top, int right, int bottom)
         {
@@ -28,54 +32,35 @@ public class AlwaysOnTop : MonoBehaviour
 
         public int X
         {
-            get
-            {
-                return Left;
-            }
+            get { return Left; }
             set
             {
-                Right -= (Left - value);
+                Right -= Left - value;
                 Left = value;
             }
         }
 
         public int Y
         {
-            get
-            {
-                return Top;
-            }
+            get { return Top; }
             set
             {
-                Bottom -= (Top - value);
+                Bottom -= Top - value;
                 Top = value;
             }
         }
 
         public int Height
         {
-            get
-            {
-                return Bottom - Top;
-            }
-            set
-            {
-                Bottom = value + Top;
-            }
+            get { return Bottom - Top; }
+            set { Bottom = value + Top; }
         }
 
         public int Width
         {
-            get
-            {
-                return Right - Left;
-            }
-            set
-            {
-                Right = value + Left;
-            }
+            get { return Right - Left; }
+            set { Right = value + Left; }
         }
-
     }
 
     [DllImport("user32.dll")]
@@ -84,7 +69,7 @@ public class AlwaysOnTop : MonoBehaviour
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetActiveWindow();
@@ -104,37 +89,41 @@ public class AlwaysOnTop : MonoBehaviour
 
     #endregion
 
-
-    // Use this for initialization
-    void Start()
+    private void Start()
     {
+        // 启动时先确保非置顶，避免继承系统历史状态。
         AssignTopmostWindow(false);
     }
 
+    // 对当前进程窗口应用置顶/取消置顶。
     public bool AssignTopmostWindow(bool makeTopmost)
     {
         IntPtr hWnd = GetCurrentProcessWindowHandle();
-        if (hWnd == System.IntPtr.Zero)
+        if (hWnd == IntPtr.Zero)
         {
-            UnityEngine.Debug.LogWarning("Current process window handle not found, skip topmost update.");
+            Debug.LogWarning("Current process window handle not found, skip topmost update.");
             return false;
         }
 
-        RECT rect = new RECT();
+        RECT rect;
         if (!GetWindowRect(new HandleRef(this, hWnd), out rect))
         {
-            UnityEngine.Debug.LogWarning("GetWindowRect failed, skip topmost update.");
+            Debug.LogWarning("GetWindowRect failed, skip topmost update.");
             return false;
         }
 
-        return SetWindowPos(hWnd, makeTopmost ? HWND_TOPMOST : HWND_NOT_TOPMOST, rect.X, rect.Y, rect.Width, rect.Height, SWP_SHOWWINDOW);
+        return SetWindowPos(
+            hWnd,
+            makeTopmost ? HWND_TOPMOST : HWND_NOT_TOPMOST,
+            rect.X,
+            rect.Y,
+            rect.Width,
+            rect.Height,
+            SWP_SHOWWINDOW
+        );
     }
 
-    public bool AssignTopmostWindow(string windowTitle, bool makeTopmost)
-    {
-        return AssignTopmostWindow(makeTopmost);
-    }
-
+    // 获取当前进程的可见窗口句柄，避免多开时命中其他实例。
     private IntPtr GetCurrentProcessWindowHandle()
     {
         var activeHandle = GetActiveWindow();
@@ -145,6 +134,7 @@ public class AlwaysOnTop : MonoBehaviour
 
         var currentProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
         IntPtr matchedHandle = IntPtr.Zero;
+
         EnumWindows((hWnd, lParam) =>
         {
             if (!IsWindowVisible(hWnd))
@@ -165,7 +155,8 @@ public class AlwaysOnTop : MonoBehaviour
         return matchedHandle;
     }
 
-    private bool IsWindowFromCurrentProcess(IntPtr hWnd)
+    // 判断句柄是否属于当前进程。
+    private static bool IsWindowFromCurrentProcess(IntPtr hWnd)
     {
         if (hWnd == IntPtr.Zero)
         {
@@ -175,6 +166,5 @@ public class AlwaysOnTop : MonoBehaviour
         GetWindowThreadProcessId(hWnd, out var processId);
         return processId == (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
     }
-
 }
 #endif

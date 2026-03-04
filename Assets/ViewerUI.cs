@@ -7,28 +7,47 @@ using UnityEngine.UIElements;
 
 using Klak.Spout;
 using UniRx;
+
+// 主界面控制脚本：负责 Spout 画面显示、背景设置、窗口行为与运行参数。
 public class ViewerUI : MonoBehaviour
 {
+    // UI 初始化状态，避免重复绑定事件。
     private bool initialized;
+    // 记录当前绑定的根节点，处理 UIDocument 重建场景。
     private VisualElement boundRoot;
+    // 自定义背景纹理缓存，便于复用与释放。
     private Texture2D customBackgroundTexture;
+    // 运行期订阅统一管理，避免生命周期泄漏。
     private readonly CompositeDisposable runtimeSubscriptions = new CompositeDisposable();
     private const string SettingsFileName = "viewer-settings.json";
-    private const int FocusedTargetFrameRate = 60;
-    private const int BackgroundTargetFrameRate = 20;
-    private const float FocusedUiUpdateInterval = 1f / 60f;
-    private const float BackgroundUiUpdateInterval = 1f / 20f;
+    // 默认刷新率为 60，允许用户手动调到 240。
+    private const int DefaultTargetFrameRate = 60;
+    private const int MaxTargetFrameRate = 240;
+    private const int MinTargetFrameRate = 1;
+    // 控制面板逻辑更新频率（不是渲染帧率）。
+    private const float ControlPanelUpdateInterval = 1f / 60f;
+    // 当前运行时刷新率（由 UI / 配置驱动）。
+    private int runtimeTargetFrameRate = DefaultTargetFrameRate;
 
     [Serializable]
     private class ViewerSettings
     {
+        // 选中的 Spout 源名称。
         public string spoutSourceName = string.Empty;
+        // 背景模式（默认/纯色/自定义）。
         public string backgroundMode = "默认";
+        // 自定义背景路径。
         public string backgroundPath = string.Empty;
+        // 是否缩放到屏幕。
         public bool scaleToScreen = true;
+        // 是否镜像画面。
         public bool mirror;
+        // 是否全屏。
         public bool fullScreen;
+        // 是否置顶窗口。
         public bool topMost;
+        // 刷新率设置（1~240）。
+        public int targetFrameRate = DefaultTargetFrameRate;
     }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
@@ -116,6 +135,7 @@ public class ViewerUI : MonoBehaviour
 
     private void OnDestroy()
     {
+        // 组件销毁时释放所有订阅与运行时纹理资源。
         runtimeSubscriptions.Dispose();
         if (customBackgroundTexture != null)
         {
@@ -126,9 +146,8 @@ public class ViewerUI : MonoBehaviour
 
     private void OnEnable()
     {
+        // 保持后台运行，方便多开与副屏场景。
         Application.runInBackground = true;
-        ApplyRuntimePerformanceMode(Application.isFocused);
-        Debug.Log($"ViewerUI perf mode init: focused={Application.isFocused}, targetFrameRate={Application.targetFrameRate}, vSync={QualitySettings.vSyncCount}");
 
         const float controlPanelMaxOpacity = 0.7f;
         const float controlPanelIdleDelay = 3f;
@@ -171,7 +190,7 @@ public class ViewerUI : MonoBehaviour
             customScaledLayer.style.bottom = 0f;
             customScaledLayer.style.display = DisplayStyle.None;
             customScaledLayer.style.backgroundColor = Color.clear;
-            customScaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+            SetBackgroundScaleMode(customScaledLayer, ScaleMode.ScaleToFit);
             customScaledLayer.pickingMode = PickingMode.Ignore;
             bg.Insert(0, customScaledLayer);
         }
@@ -185,10 +204,11 @@ public class ViewerUI : MonoBehaviour
             customUnscaledLayer.style.top = 0f;
             customUnscaledLayer.style.display = DisplayStyle.None;
             customUnscaledLayer.style.backgroundColor = Color.clear;
-            customUnscaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+            SetBackgroundScaleMode(customUnscaledLayer, ScaleMode.ScaleToFit);
             customUnscaledLayer.pickingMode = PickingMode.Ignore;
             unscaledContent.Insert(0, customUnscaledLayer);
         }
+        // 绑定 UI 控件。
         var controlPanel = root.Q<VisualElement>("ControlPanel");
         var spoutDropdown = root.Q<DropdownField>("SpoutNames");
         var backgroundModeDropdown = root.Q<DropdownField>("BgMode");
@@ -198,6 +218,7 @@ public class ViewerUI : MonoBehaviour
         var scaleToggle = root.Q<Toggle>("TexScale");
         var mirrorToggle = root.Q<Toggle>("Mirror");
         var fullScreenToggle = root.Q<Toggle>("FullScreen");
+        var targetFrameRateField = root.Q<IntegerField>("TargetFrameRate");
         var saveTextureButton = root.Q<Button>("SaveTexture");
         var saveSettingsButton = root.Q<Button>("SaveSettings");
 
@@ -223,7 +244,10 @@ public class ViewerUI : MonoBehaviour
         var windowedHeight = Screen.height;
         var lastScreenWidth = Screen.width;
         var lastScreenHeight = Screen.height;
+        // 读取并应用持久化设置。
         var loadedSettings = LoadSettings();
+        runtimeTargetFrameRate = SanitizeTargetFrameRate(loadedSettings != null ? loadedSettings.targetFrameRate : runtimeTargetFrameRate);
+        ApplyRuntimePerformanceMode();
 
         if (scaled != null)
         {
@@ -234,6 +258,7 @@ public class ViewerUI : MonoBehaviour
             scrollView.style.backgroundColor = Color.clear;
         }
 
+        // Spout 源下拉框绑定。
         if (spoutDropdown != null)
         {
             spoutDropdown.style.display = DisplayStyle.Flex;
@@ -280,6 +305,7 @@ public class ViewerUI : MonoBehaviour
             });
         }
 
+        // 背景模式与背景路径绑定。
         if (backgroundModeDropdown != null)
         {
             backgroundModeDropdown.choices = new[] { "默认", "红色", "蓝色", "绿色", "洋红色", "灰色", "白色", "自定义" }.ToList();
@@ -324,7 +350,7 @@ public class ViewerUI : MonoBehaviour
             TryOpenBackgroundPicker();
         }, TrickleDown.TrickleDown);
 
-                backgroundPathField?.RegisterCallback<ClickEvent>(_ =>
+        backgroundPathField?.RegisterCallback<ClickEvent>(_ =>
         {
             TryOpenBackgroundPicker();
         }, TrickleDown.TrickleDown);
@@ -349,6 +375,24 @@ public class ViewerUI : MonoBehaviour
         if (alwaysOnTop != null && topMost != null)
         {
             alwaysOnTop.AssignTopmostWindow(topMost.value);
+        }
+
+        // 刷新率输入：即时生效并限制在 1~240。
+        if (targetFrameRateField != null)
+        {
+            targetFrameRateField.SetValueWithoutNotify(runtimeTargetFrameRate);
+            targetFrameRateField.RegisterValueChangedCallback(evt =>
+            {
+                var sanitized = SanitizeTargetFrameRate(evt.newValue);
+                if (sanitized != evt.newValue)
+                {
+                    targetFrameRateField.SetValueWithoutNotify(sanitized);
+                }
+
+                runtimeTargetFrameRate = sanitized;
+                ApplyRuntimePerformanceMode();
+                MarkControlPanelActive();
+            });
         }
 
         scaleToggle?.RegisterValueChangedCallback(evt =>
@@ -421,6 +465,7 @@ public class ViewerUI : MonoBehaviour
             };
         }
 
+        // 保存设置按钮：把当前 UI 状态写入配置文件。
         if (saveSettingsButton != null)
         {
             saveSettingsButton.clicked += () =>
@@ -433,7 +478,8 @@ public class ViewerUI : MonoBehaviour
                     scaleToScreen = scaleToggle != null && scaleToggle.value,
                     mirror = mirrorToggle != null && mirrorToggle.value,
                     fullScreen = fullScreenToggle != null ? fullScreenToggle.value : IsFullscreenActive(),
-                    topMost = topMost != null && topMost.value
+                    topMost = topMost != null && topMost.value,
+                    targetFrameRate = runtimeTargetFrameRate
                 });
                 MarkControlPanelActive();
             };
@@ -445,10 +491,12 @@ public class ViewerUI : MonoBehaviour
         HideControlPanelImmediately();
         UpdateControlPanelLayout();
 
+        // 监听 Spout 纹理变化并刷新显示。
         spoutReceiver.ObserveEveryValueChanged(r => r.receivedTexture)
             .Subscribe(tex => SetTexture(tex, spoutDropdown != null ? spoutDropdown.value : string.Empty))
             .AddTo(runtimeSubscriptions);
 
+        // 每帧更新控制面板逻辑（含节流）。
         Observable.EveryUpdate()
             .Where(_ => isActiveAndEnabled)
             .Subscribe(_ =>
@@ -461,24 +509,25 @@ public class ViewerUI : MonoBehaviour
                     UpdateCustomBackgroundScaleMode();
                 }
 
-                var uiUpdateInterval = Application.isFocused ? FocusedUiUpdateInterval : BackgroundUiUpdateInterval;
                 if (Time.unscaledTime < nextUiUpdateTime)
                 {
                     return;
                 }
 
-                nextUiUpdateTime = Time.unscaledTime + uiUpdateInterval;
+                nextUiUpdateTime = Time.unscaledTime + ControlPanelUpdateInterval;
                 UpdateControlPanel();
             })
             .AddTo(runtimeSubscriptions);
 
         initialized = true;
 
+        // 当前是否处于“自定义背景”模式。
         bool IsCustomBackgroundMode()
         {
             return backgroundModeDropdown != null && backgroundModeDropdown.value == "自定义";
         }
 
+        // 尝试打开背景图片选择器（含防抖）。
         void TryOpenBackgroundPicker()
         {
             if (backgroundPathField == null || !IsCustomBackgroundMode())
@@ -502,6 +551,7 @@ public class ViewerUI : MonoBehaviour
             MarkControlPanelActive();
         }
 
+        // 根据“缩放到屏幕”开关选择背景缩放模式。
         ScaleMode GetCustomBackgroundScaleMode()
         {
             return scaleToggle != null && scaleToggle.value
@@ -509,6 +559,7 @@ public class ViewerUI : MonoBehaviour
                 : ScaleMode.ScaleAndCrop;
         }
 
+        // 更新自定义背景在缩放/非缩放场景下的展示方式。
         void UpdateCustomBackgroundScaleMode()
         {
             if (customBackgroundTexture == null || !IsCustomBackgroundMode())
@@ -536,7 +587,7 @@ public class ViewerUI : MonoBehaviour
                     customScaledLayer.style.bottom = 0f;
                     customScaledLayer.style.width = StyleKeyword.Auto;
                     customScaledLayer.style.height = StyleKeyword.Auto;
-                    customScaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+                    SetBackgroundScaleMode(customScaledLayer, ScaleMode.ScaleToFit);
                 }
 
                 if (customUnscaledLayer != null)
@@ -564,11 +615,43 @@ public class ViewerUI : MonoBehaviour
 
                 customUnscaledLayer.style.width = targetWidth;
                 customUnscaledLayer.style.height = targetHeight;
-                customUnscaledLayer.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+                SetBackgroundScaleMode(customUnscaledLayer, ScaleMode.ScaleToFit);
                 customUnscaledLayer.style.display = DisplayStyle.Flex;
             }
         }
 
+        // 使用 UI Toolkit 新的 background-* 属性替代已弃用的 unityBackgroundScaleMode。
+        void SetBackgroundScaleMode(VisualElement element, ScaleMode mode)
+        {
+            if (element == null)
+            {
+                return;
+            }
+
+            BackgroundSize backgroundSize;
+            switch (mode)
+            {
+                case ScaleMode.ScaleAndCrop:
+                    backgroundSize = new BackgroundSize(BackgroundSizeType.Cover);
+                    break;
+                case ScaleMode.StretchToFill:
+                    backgroundSize = new BackgroundSize(
+                        new Length(100f, LengthUnit.Percent),
+                        new Length(100f, LengthUnit.Percent)
+                    );
+                    break;
+                default:
+                    backgroundSize = new BackgroundSize(BackgroundSizeType.Contain);
+                    break;
+            }
+
+            element.style.backgroundSize = new StyleBackgroundSize(backgroundSize);
+            element.style.backgroundPositionX = new StyleBackgroundPosition(new BackgroundPosition(BackgroundPositionKeyword.Center));
+            element.style.backgroundPositionY = new StyleBackgroundPosition(new BackgroundPosition(BackgroundPositionKeyword.Center));
+            element.style.backgroundRepeat = new StyleBackgroundRepeat(new BackgroundRepeat(Repeat.NoRepeat, Repeat.NoRepeat));
+        }
+
+        // 根据背景模式控制背景路径输入框显隐。
         void UpdateBackgroundControlsVisibility()
         {
             var showCustom = IsCustomBackgroundMode();
@@ -578,6 +661,7 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 按当前下拉选择应用背景。
         void ApplyBackgroundFromSelection()
         {
             var mode = backgroundModeDropdown != null ? backgroundModeDropdown.value : "默认";
@@ -610,6 +694,7 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 应用纯色背景，并清理自定义背景图层。
         void ApplyBackgroundColor(Color color)
         {
             if (bg == null)
@@ -632,6 +717,7 @@ public class ViewerUI : MonoBehaviour
             bg.style.backgroundColor = color;
         }
 
+        // 从本地文件加载并应用自定义背景。
         void ApplyCustomBackground(string path)
         {
             if (bg == null)
@@ -673,7 +759,7 @@ public class ViewerUI : MonoBehaviour
                 if (customScaledLayer == null && customUnscaledLayer == null)
                 {
                     bg.style.backgroundImage = Background.FromTexture2D(customBackgroundTexture);
-                    bg.style.unityBackgroundScaleMode = GetCustomBackgroundScaleMode();
+                    SetBackgroundScaleMode(bg, GetCustomBackgroundScaleMode());
                 }
 
                 bg.style.backgroundColor = Color.black;
@@ -685,14 +771,20 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 设置当前 Spout 纹理到缩放/原始视图层。
         void SetTexture(RenderTexture tex, string texName = "")
         {
             currentTex = tex;
             if (tex != null)
             {
                 var scaledTarget = scaled ?? bg;
+                if (scaledTarget == null)
+                {
+                    return;
+                }
+
                 scaledTarget.style.backgroundImage = Background.FromRenderTexture(tex);
-                scaledTarget.style.unityBackgroundScaleMode = ScaleMode.ScaleToFit;
+                SetBackgroundScaleMode(scaledTarget, ScaleMode.ScaleToFit);
                 if (unscaled != null)
                 {
                     unscaled.style.backgroundImage = Background.FromRenderTexture(tex);
@@ -710,24 +802,29 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 镜像显示开关（通过 X 轴缩放翻转）。
         void SetMirror(bool isMirrored)
         {
             var x = isMirrored ? -1f : 1f;
             var scaledTarget = scaled ?? bg;
-            scaledTarget.transform.scale = new Vector3(x, 1f, 1f);
+            if (scaledTarget != null)
+            {
+                scaledTarget.style.scale = new StyleScale(new Scale(new Vector3(x, 1f, 1f)));
+            }
             if (unscaled != null)
             {
-                unscaled.transform.scale = new Vector3(x, 1f, 1f);
+                unscaled.style.scale = new StyleScale(new Scale(new Vector3(x, 1f, 1f)));
             }
             if (customScaledLayer != null)
             {
-                customScaledLayer.transform.scale = new Vector3(x, 1f, 1f);
+                customScaledLayer.style.scale = new StyleScale(new Scale(new Vector3(x, 1f, 1f)));
             }
             if (customUnscaledLayer != null)
             {
-                customUnscaledLayer.transform.scale = new Vector3(x, 1f, 1f);
+                customUnscaledLayer.style.scale = new StyleScale(new Scale(new Vector3(x, 1f, 1f)));
             }
         }
+        // 切换全屏与窗口模式。
         void SetFullScreen(bool isFullScreen)
         {
             var currentlyFullscreen = IsFullscreenActive();
@@ -752,6 +849,7 @@ public class ViewerUI : MonoBehaviour
             EnsureScaledViewportFill();
         }
 
+        // 判断当前是否处于全屏态（容忍少量分辨率偏差）。
         bool IsFullscreenActive()
         {
             if (!Screen.fullScreen || Screen.fullScreenMode == FullScreenMode.Windowed)
@@ -772,6 +870,7 @@ public class ViewerUI : MonoBehaviour
             return widthMatch && heightMatch;
         }
 
+        // 获取当前窗口所在显示器的目标分辨率。
         void GetTargetMonitorResolution(out int width, out int height)
         {
             width = Screen.currentResolution.width;
@@ -794,6 +893,7 @@ public class ViewerUI : MonoBehaviour
         }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        // Windows 下通过窗口句柄查询显示器分辨率。
         bool TryGetWindowMonitorResolution(out int width, out int height)
         {
             width = 0;
@@ -827,6 +927,7 @@ public class ViewerUI : MonoBehaviour
         }
 #endif
 
+        // 保证缩放层始终铺满视口。
         void EnsureScaledViewportFill()
         {
             var scaledTarget = scaled ?? bg;
@@ -843,6 +944,7 @@ public class ViewerUI : MonoBehaviour
             scaledTarget.style.height = StyleKeyword.Auto;
         }
 
+        // 根据窗口尺寸动态计算控制面板布局。
         void UpdateControlPanelLayout()
         {
             if (controlPanel == null)
@@ -878,6 +980,7 @@ public class ViewerUI : MonoBehaviour
             controlPanel.style.paddingRight = compact ? 6f : 8f;
         }
 
+        // 控制面板输入、热键与显隐逻辑更新。
         void UpdateControlPanel()
         {
             if (Application.isFocused)
@@ -929,6 +1032,7 @@ public class ViewerUI : MonoBehaviour
             AutoFadeControlPanel();
         }
 
+        // 切换控制面板显示状态。
         void ToggleControlPanelVisibility()
         {
             if (controlPanel == null)
@@ -946,6 +1050,7 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 显示控制面板并恢复交互。
         void ShowControlPanel()
         {
             if (controlPanel == null)
@@ -959,6 +1064,7 @@ public class ViewerUI : MonoBehaviour
             lastControlPanelActivityTime = Time.unscaledTime;
         }
 
+        // 立即隐藏控制面板并停止交互。
         void HideControlPanelImmediately()
         {
             if (controlPanel == null)
@@ -976,6 +1082,7 @@ public class ViewerUI : MonoBehaviour
             controlPanel.style.display = DisplayStyle.None;
         }
 
+        // 标记控制面板活跃，重置自动淡出计时。
         void MarkControlPanelActive()
         {
             if (controlPanel == null || controlPanel.style.display == DisplayStyle.None)
@@ -987,6 +1094,7 @@ public class ViewerUI : MonoBehaviour
             lastControlPanelActivityTime = Time.unscaledTime;
         }
 
+        // 自动淡出控制面板，避免遮挡画面。
         void AutoFadeControlPanel()
         {
             if (controlPanel == null || controlPanel.style.display == DisplayStyle.None)
@@ -1027,6 +1135,7 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        // 下拉弹窗可见性检测（节流版本）。
         bool IsAnyDropdownPopupVisibleThrottled()
         {
             if (Time.unscaledTime < nextDropdownPopupScanTime)
@@ -1039,6 +1148,7 @@ public class ViewerUI : MonoBehaviour
             return cachedDropdownPopupVisible;
         }
 
+        // 判断当前是否存在可见下拉弹窗。
         bool IsAnyDropdownPopupVisible()
         {
             if (root == null || root.panel == null)
@@ -1084,6 +1194,7 @@ public class ViewerUI : MonoBehaviour
             return false;
         }
 
+        // 通过类名启发式识别弹窗元素。
         bool HasPopupLikeClass(VisualElement element)
         {
             foreach (var className in element.GetClasses())
@@ -1098,6 +1209,7 @@ public class ViewerUI : MonoBehaviour
             return false;
         }
 
+        // 判断元素是否为指定祖先的后代。
         bool IsDescendantOf(VisualElement element, VisualElement ancestor)
         {
             if (element == null || ancestor == null)
@@ -1116,11 +1228,13 @@ public class ViewerUI : MonoBehaviour
             return false;
         }
 
+        // 安全关闭源下拉弹窗焦点。
         void CloseSourceDropdownPopupSafely()
         {
             spoutDropdown?.Blur();
         }
 
+        // 设置控制面板交互能力与拾取模式。
         void SetControlPanelInteractive(bool isInteractive)
         {
             if (controlPanel == null)
@@ -1132,6 +1246,7 @@ public class ViewerUI : MonoBehaviour
             controlPanel.pickingMode = isInteractive ? PickingMode.Position : PickingMode.Ignore;
         }
 
+        // 判断鼠标是否在控制面板内。
         bool IsPointerInsideControlPanel()
         {
             if (controlPanel == null || root.panel == null || controlPanel.style.display == DisplayStyle.None)
@@ -1143,59 +1258,70 @@ public class ViewerUI : MonoBehaviour
             return controlPanel.worldBound.Contains(panelPointer);
         }
 
+        // 将当前纹理截图保存为 PNG。
         void SaveTexture()
         {
             if (currentTex != null)
             {
                 var tmp = RenderTexture.active;
-
                 var w = currentTex.width;
                 var h = currentTex.height;
-                var rt = new RenderTexture(w, h, 0);
-                var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
-
-                Graphics.Blit(currentTex, rt);
-                RenderTexture.active = rt;
-                tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-                var data = tex.EncodeToPNG();
-                var now = System.DateTime.Now;
-                var fileNmae = $"{currentTex.name}_{now.Year}_{now.Month:00}{now.Day:00}_{now.Hour:00}{now.Minute:00}.png";
+                var rt = (RenderTexture)null;
+                var tex = (Texture2D)null;
                 try
                 {
-                    File.WriteAllBytes(fileNmae, data);
+                    rt = new RenderTexture(w, h, 0);
+                    tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+
+                    Graphics.Blit(currentTex, rt);
+                    RenderTexture.active = rt;
+                    tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                    var data = tex.EncodeToPNG();
+                    var now = System.DateTime.Now;
+                    var fileName = $"{currentTex.name}_{now.Year}_{now.Month:00}{now.Day:00}_{now.Hour:00}{now.Minute:00}.png";
+                    File.WriteAllBytes(fileName, data);
                 }
                 catch (System.Exception e)
                 {
                     Debug.LogError($"Failed to save texture: {e.Message}");
                 }
-
-                RenderTexture.active = tmp;
-                rt.Release();
-                Destroy(rt);
-                Destroy(tex);
+                finally
+                {
+                    RenderTexture.active = tmp;
+                    if (rt != null)
+                    {
+                        rt.Release();
+                        Destroy(rt);
+                    }
+                    if (tex != null)
+                    {
+                        Destroy(tex);
+                    }
+                }
             }
         }
     }
 
-    private void OnApplicationFocus(bool hasFocus)
-    {
-        ApplyRuntimePerformanceMode(hasFocus);
-        Debug.Log($"ViewerUI focus changed: focused={hasFocus}, targetFrameRate={Application.targetFrameRate}");
-    }
-
-    private void OnApplicationPause(bool pauseStatus)
-    {
-        ApplyRuntimePerformanceMode(!pauseStatus && Application.isFocused);
-        Debug.Log($"ViewerUI pause changed: paused={pauseStatus}, focused={Application.isFocused}, targetFrameRate={Application.targetFrameRate}");
-    }
-
-    private void ApplyRuntimePerformanceMode(bool isFocused)
+    // 应用运行时性能策略：关闭 vSync，使用用户设定帧率。
+    private void ApplyRuntimePerformanceMode()
     {
         // Avoid relying on broken vSync in some multi-window / multi-monitor setups.
         QualitySettings.vSyncCount = 0;
-        Application.targetFrameRate = isFocused ? FocusedTargetFrameRate : BackgroundTargetFrameRate;
+        Application.targetFrameRate = runtimeTargetFrameRate;
     }
 
+    // 规范化刷新率输入，确保处于合法范围。
+    private static int SanitizeTargetFrameRate(int value)
+    {
+        if (value <= 0)
+        {
+            return DefaultTargetFrameRate;
+        }
+
+        return Mathf.Clamp(value, MinTargetFrameRate, MaxTargetFrameRate);
+    }
+
+    // 获取配置文件路径（优先 exe 同目录）。
     private string GetSettingsFilePath()
     {
         try
@@ -1220,6 +1346,7 @@ public class ViewerUI : MonoBehaviour
         }
     }
 
+    // 读取配置文件。
     private ViewerSettings LoadSettings()
     {
         var path = GetSettingsFilePath();
@@ -1240,6 +1367,7 @@ public class ViewerUI : MonoBehaviour
         }
     }
 
+    // 写入配置文件。
     private void SaveSettings(ViewerSettings settings)
     {
         if (settings == null)
@@ -1258,6 +1386,7 @@ public class ViewerUI : MonoBehaviour
             Debug.LogError($"Failed to save settings: {e.Message}");
         }
     }
+    // 打开图片选择对话框（按平台分发）。
     private string OpenImageFileDialog()
     {
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
@@ -1268,6 +1397,7 @@ public class ViewerUI : MonoBehaviour
     }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+    // Windows 原生文件选择框。
     private string OpenWindowsImageFileDialog()
     {
         var openFileName = new OpenFileName
@@ -1294,6 +1424,7 @@ public class ViewerUI : MonoBehaviour
         return selectedPath;
     }
 
+    // 获取当前进程对应的主窗口句柄，避免多开串窗。
     private IntPtr GetCurrentProcessWindowHandle()
     {
         var activeHandle = GetActiveWindow();
@@ -1324,6 +1455,7 @@ public class ViewerUI : MonoBehaviour
         return matchedHandle;
     }
 
+    // 判断句柄是否属于当前进程。
     private bool IsWindowFromCurrentProcess(IntPtr hWnd)
     {
         if (hWnd == IntPtr.Zero)
