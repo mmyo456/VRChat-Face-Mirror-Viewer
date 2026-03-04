@@ -14,6 +14,10 @@ public class ViewerUI : MonoBehaviour
     private Texture2D customBackgroundTexture;
     private readonly CompositeDisposable runtimeSubscriptions = new CompositeDisposable();
     private const string SettingsFileName = "viewer-settings.json";
+    private const int FocusedTargetFrameRate = 60;
+    private const int BackgroundTargetFrameRate = 20;
+    private const float FocusedUiUpdateInterval = 1f / 60f;
+    private const float BackgroundUiUpdateInterval = 1f / 20f;
 
     [Serializable]
     private class ViewerSettings
@@ -51,15 +55,25 @@ public class ViewerUI : MonoBehaviour
     [DllImport("user32.dll")]
     private static extern System.IntPtr GetActiveWindow();
 
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern System.IntPtr FindWindow(string lpClassName, string lpWindowName);
-
     [DllImport("user32.dll")]
     private static extern System.IntPtr MonitorFromWindow(System.IntPtr hwnd, uint dwFlags);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetMonitorInfo(System.IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [DllImport("comdlg32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -113,6 +127,8 @@ public class ViewerUI : MonoBehaviour
     private void OnEnable()
     {
         Application.runInBackground = true;
+        ApplyRuntimePerformanceMode(Application.isFocused);
+        Debug.Log($"ViewerUI perf mode init: focused={Application.isFocused}, targetFrameRate={Application.targetFrameRate}, vSync={QualitySettings.vSyncCount}");
 
         const float controlPanelMaxOpacity = 0.7f;
         const float controlPanelIdleDelay = 3f;
@@ -191,10 +207,17 @@ public class ViewerUI : MonoBehaviour
             return;
         }
 
-                var currentTex = (RenderTexture)null;
+        var currentTex = (RenderTexture)null;
         var lastControlPanelActivityTime = Time.unscaledTime;
         var isSourceDropdownInteracting = false;
         var lastSourceDropdownInteractionTime = Time.unscaledTime;
+        const float dropdownPopupScanInterval = 0.15f;
+        var cachedDropdownPopupVisible = false;
+        var nextDropdownPopupScanTime = 0f;
+        var nextUiUpdateTime = 0f;
+        const float fullscreenProbeInterval = 0.5f;
+        var cachedFullscreenState = IsFullscreenActive();
+        var nextFullscreenProbeTime = 0f;
         var lastBackgroundPickerOpenTime = -10f;
         var windowedWidth = Screen.width;
         var windowedHeight = Screen.height;
@@ -232,6 +255,7 @@ public class ViewerUI : MonoBehaviour
             {
                 isSourceDropdownInteracting = true;
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
+                cachedDropdownPopupVisible = true;
                 SetTexture(spoutReceiver.receivedTexture, spoutDropdown.value);
                 spoutDropdown.choices = SpoutManager.GetSourceNames().ToList();
                 MarkControlPanelActive();
@@ -240,12 +264,18 @@ public class ViewerUI : MonoBehaviour
             {
                 isSourceDropdownInteracting = true;
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
+                cachedDropdownPopupVisible = true;
                 MarkControlPanelActive();
             });
-            spoutDropdown.RegisterCallback<FocusOutEvent>(_ => lastSourceDropdownInteractionTime = Time.unscaledTime);
+            spoutDropdown.RegisterCallback<FocusOutEvent>(_ =>
+            {
+                cachedDropdownPopupVisible = false;
+                lastSourceDropdownInteractionTime = Time.unscaledTime;
+            });
             spoutDropdown.RegisterValueChangedCallback(_ =>
             {
                 isSourceDropdownInteracting = false;
+                cachedDropdownPopupVisible = false;
                 lastSourceDropdownInteractionTime = Time.unscaledTime;
             });
         }
@@ -311,14 +341,14 @@ public class ViewerUI : MonoBehaviour
         {
             if (alwaysOnTop != null)
             {
-                alwaysOnTop.AssignTopmostWindow(Application.productName, evt.newValue);
+                alwaysOnTop.AssignTopmostWindow(evt.newValue);
             }
             MarkControlPanelActive();
         });
 
         if (alwaysOnTop != null && topMost != null)
         {
-            alwaysOnTop.AssignTopmostWindow(Application.productName, topMost.value);
+            alwaysOnTop.AssignTopmostWindow(topMost.value);
         }
 
         scaleToggle?.RegisterValueChangedCallback(evt =>
@@ -366,16 +396,19 @@ public class ViewerUI : MonoBehaviour
 
         if (fullScreenToggle != null)
         {
-            var initialFullscreen = loadedSettings != null ? loadedSettings.fullScreen : IsFullscreenActive();
+            var initialFullscreen = loadedSettings != null ? loadedSettings.fullScreen : cachedFullscreenState;
             fullScreenToggle.SetValueWithoutNotify(initialFullscreen);
             fullScreenToggle.RegisterValueChangedCallback(evt =>
             {
                 SetFullScreen(evt.newValue);
+                cachedFullscreenState = evt.newValue;
+                nextFullscreenProbeTime = 0f;
                 MarkControlPanelActive();
             });
-            if (initialFullscreen != IsFullscreenActive())
+            if (initialFullscreen != cachedFullscreenState)
             {
                 SetFullScreen(initialFullscreen);
+                cachedFullscreenState = initialFullscreen;
             }
         }
 
@@ -428,6 +461,13 @@ public class ViewerUI : MonoBehaviour
                     UpdateCustomBackgroundScaleMode();
                 }
 
+                var uiUpdateInterval = Application.isFocused ? FocusedUiUpdateInterval : BackgroundUiUpdateInterval;
+                if (Time.unscaledTime < nextUiUpdateTime)
+                {
+                    return;
+                }
+
+                nextUiUpdateTime = Time.unscaledTime + uiUpdateInterval;
                 UpdateControlPanel();
             })
             .AddTo(runtimeSubscriptions);
@@ -762,7 +802,7 @@ public class ViewerUI : MonoBehaviour
             var hwnd = GetActiveWindow();
             if (hwnd == System.IntPtr.Zero)
             {
-                hwnd = FindWindow(null, Application.productName);
+                hwnd = GetCurrentProcessWindowHandle();
             }
             if (hwnd == System.IntPtr.Zero)
             {
@@ -842,7 +882,13 @@ public class ViewerUI : MonoBehaviour
         {
             if (Application.isFocused)
             {
-                var fullscreenActive = IsFullscreenActive();
+                if (Time.unscaledTime >= nextFullscreenProbeTime)
+                {
+                    cachedFullscreenState = IsFullscreenActive();
+                    nextFullscreenProbeTime = Time.unscaledTime + fullscreenProbeInterval;
+                }
+
+                var fullscreenActive = cachedFullscreenState;
                 if (fullScreenToggle != null && fullScreenToggle.value != fullscreenActive)
                 {
                     fullScreenToggle.SetValueWithoutNotify(fullscreenActive);
@@ -861,6 +907,8 @@ public class ViewerUI : MonoBehaviour
                 if (altEnterPressed)
                 {
                     SetFullScreen(!fullscreenActive);
+                    cachedFullscreenState = !fullscreenActive;
+                    nextFullscreenProbeTime = 0f;
                     MarkControlPanelActive();
                 }
 
@@ -919,6 +967,8 @@ public class ViewerUI : MonoBehaviour
             }
 
             isSourceDropdownInteracting = false;
+            cachedDropdownPopupVisible = false;
+            nextDropdownPopupScanTime = 0f;
             lastSourceDropdownInteractionTime = 0f;
             CloseSourceDropdownPopupSafely();
             SetControlPanelInteractive(false);
@@ -944,7 +994,7 @@ public class ViewerUI : MonoBehaviour
                 return;
             }
 
-            var dropdownPopupVisible = IsAnyDropdownPopupVisible();
+            var dropdownPopupVisible = IsAnyDropdownPopupVisibleThrottled();
             if (isSourceDropdownInteracting && !dropdownPopupVisible && Time.unscaledTime - lastSourceDropdownInteractionTime > 0.25f)
             {
                 isSourceDropdownInteracting = false;
@@ -977,6 +1027,18 @@ public class ViewerUI : MonoBehaviour
             }
         }
 
+        bool IsAnyDropdownPopupVisibleThrottled()
+        {
+            if (Time.unscaledTime < nextDropdownPopupScanTime)
+            {
+                return cachedDropdownPopupVisible;
+            }
+
+            nextDropdownPopupScanTime = Time.unscaledTime + dropdownPopupScanInterval;
+            cachedDropdownPopupVisible = IsAnyDropdownPopupVisible();
+            return cachedDropdownPopupVisible;
+        }
+
         bool IsAnyDropdownPopupVisible()
         {
             if (root == null || root.panel == null)
@@ -999,17 +1061,24 @@ public class ViewerUI : MonoBehaviour
                 }
             }
 
-            foreach (var element in panelRoot.Query<VisualElement>().ToList())
+            try
             {
-                if (element.resolvedStyle.display == DisplayStyle.None || element.resolvedStyle.visibility != Visibility.Visible)
+                foreach (var element in panelRoot.Query<VisualElement>().ToList())
                 {
-                    continue;
-                }
+                    if (element.resolvedStyle.display == DisplayStyle.None || element.resolvedStyle.visibility != Visibility.Visible)
+                    {
+                        continue;
+                    }
 
-                if (!IsDescendantOf(element, controlPanel) && HasPopupLikeClass(element))
-                {
-                    return true;
+                    if (!IsDescendantOf(element, controlPanel) && HasPopupLikeClass(element))
+                    {
+                        return true;
+                    }
                 }
+            }
+            catch
+            {
+                return false;
             }
 
             return false;
@@ -1108,6 +1177,25 @@ public class ViewerUI : MonoBehaviour
         }
     }
 
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        ApplyRuntimePerformanceMode(hasFocus);
+        Debug.Log($"ViewerUI focus changed: focused={hasFocus}, targetFrameRate={Application.targetFrameRate}");
+    }
+
+    private void OnApplicationPause(bool pauseStatus)
+    {
+        ApplyRuntimePerformanceMode(!pauseStatus && Application.isFocused);
+        Debug.Log($"ViewerUI pause changed: paused={pauseStatus}, focused={Application.isFocused}, targetFrameRate={Application.targetFrameRate}");
+    }
+
+    private void ApplyRuntimePerformanceMode(bool isFocused)
+    {
+        // Avoid relying on broken vSync in some multi-window / multi-monitor setups.
+        QualitySettings.vSyncCount = 0;
+        Application.targetFrameRate = isFocused ? FocusedTargetFrameRate : BackgroundTargetFrameRate;
+    }
+
     private string GetSettingsFilePath()
     {
         try
@@ -1184,17 +1272,12 @@ public class ViewerUI : MonoBehaviour
     {
         var openFileName = new OpenFileName
         {
-            dlgOwner = GetActiveWindow(),
+            dlgOwner = GetCurrentProcessWindowHandle(),
             filter = "图片文件 (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.tga;*.exr;*.hdr;*.ico)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.tga;*.exr;*.hdr;*.ico\0所有文件 (*.*)\0*.*\0\0",
             initialDir = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
             title = "选择背景图片",
             flags = OfnExplorer | OfnPathMustExist | OfnFileMustExist | OfnHideReadOnly | OfnNoChangeDir
         };
-
-        if (openFileName.dlgOwner == IntPtr.Zero)
-        {
-            openFileName.dlgOwner = FindWindow(null, Application.productName);
-        }
 
         if (!GetOpenFileName(openFileName))
         {
@@ -1209,6 +1292,47 @@ public class ViewerUI : MonoBehaviour
         }
 
         return selectedPath;
+    }
+
+    private IntPtr GetCurrentProcessWindowHandle()
+    {
+        var activeHandle = GetActiveWindow();
+        if (IsWindowFromCurrentProcess(activeHandle))
+        {
+            return activeHandle;
+        }
+
+        var currentProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        IntPtr matchedHandle = IntPtr.Zero;
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (!IsWindowVisible(hWnd))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(hWnd, out var processId);
+            if (processId != currentProcessId)
+            {
+                return true;
+            }
+
+            matchedHandle = hWnd;
+            return false;
+        }, IntPtr.Zero);
+
+        return matchedHandle;
+    }
+
+    private bool IsWindowFromCurrentProcess(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        GetWindowThreadProcessId(hWnd, out var processId);
+        return processId == (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
     }
 #endif
 }

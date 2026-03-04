@@ -78,9 +78,6 @@ public class AlwaysOnTop : MonoBehaviour
 
     }
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern System.IntPtr FindWindow(String lpClassName, String lpWindowName);
-
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetWindowRect(HandleRef hWnd, out RECT lpRect);
@@ -89,23 +86,37 @@ public class AlwaysOnTop : MonoBehaviour
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(System.IntPtr hWnd, System.IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetActiveWindow();
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
     #endregion
 
 
     // Use this for initialization
     void Start()
     {
-        AssignTopmostWindow(Application.productName, false);
+        AssignTopmostWindow(false);
     }
 
-    public bool AssignTopmostWindow(string WindowTitle, bool MakeTopmost)
+    public bool AssignTopmostWindow(bool makeTopmost)
     {
-        UnityEngine.Debug.Log("Assigning top most flag to window of title: " + WindowTitle);
-
-        System.IntPtr hWnd = FindWindow((string)null, WindowTitle);
+        IntPtr hWnd = GetCurrentProcessWindowHandle();
         if (hWnd == System.IntPtr.Zero)
         {
-            UnityEngine.Debug.LogWarning("Window handle not found, skip topmost update.");
+            UnityEngine.Debug.LogWarning("Current process window handle not found, skip topmost update.");
             return false;
         }
 
@@ -116,7 +127,53 @@ public class AlwaysOnTop : MonoBehaviour
             return false;
         }
 
-        return SetWindowPos(hWnd, MakeTopmost ? HWND_TOPMOST : HWND_NOT_TOPMOST, rect.X, rect.Y, rect.Width, rect.Height, SWP_SHOWWINDOW);
+        return SetWindowPos(hWnd, makeTopmost ? HWND_TOPMOST : HWND_NOT_TOPMOST, rect.X, rect.Y, rect.Width, rect.Height, SWP_SHOWWINDOW);
+    }
+
+    public bool AssignTopmostWindow(string windowTitle, bool makeTopmost)
+    {
+        return AssignTopmostWindow(makeTopmost);
+    }
+
+    private IntPtr GetCurrentProcessWindowHandle()
+    {
+        var activeHandle = GetActiveWindow();
+        if (IsWindowFromCurrentProcess(activeHandle))
+        {
+            return activeHandle;
+        }
+
+        var currentProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        IntPtr matchedHandle = IntPtr.Zero;
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (!IsWindowVisible(hWnd))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(hWnd, out var processId);
+            if (processId != currentProcessId)
+            {
+                return true;
+            }
+
+            matchedHandle = hWnd;
+            return false;
+        }, IntPtr.Zero);
+
+        return matchedHandle;
+    }
+
+    private bool IsWindowFromCurrentProcess(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        GetWindowThreadProcessId(hWnd, out var processId);
+        return processId == (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
     }
 
 }
