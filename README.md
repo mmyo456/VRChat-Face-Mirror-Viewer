@@ -42,7 +42,7 @@
 
 - 截屏保存目录在exe文件的根目录。
 - 也可以读其他spout流，比如VRChat直播相机。
-- 使用Unity6，DX12,可能不兼容不支持DX12的设备。
+- 程序默认使用DX12运行 如出现未响应等问题可以使用 "-force-d3d11" 启动方式。
 
 ---
 
@@ -51,4 +51,5 @@
 - [KlakSpout](https://github.com/keijiro/KlakSpout) - 提供的代码参考
 
 - [spout-ndi-viewer](https://github.com/sugi-cho/spout-ndi-viewer) - 提供的代码参考
+
 
